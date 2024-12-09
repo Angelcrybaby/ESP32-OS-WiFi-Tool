@@ -1,0 +1,606 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <esp_wifi.h>
+#include <Wire.h>
+
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+#define OLED_RESET -1    // Reset pin # (or -1 if sharing Arduino reset pin)
+#define BUTTON_PIN 0     // GPIO pin for on-board button
+#define GRAPH_WIDTH 128
+#define GRAPH_HEIGHT 16
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const char *ssid = "ESP32_Server";
+const char *password = "";
+
+IPAddress apIP(192, 168, 4, 1);
+DNSServer dnsServer;
+WebServer server(80);
+
+const int buttonPin = 0; // GPIO pin for on-board button
+unsigned long stopwatchStart = 0;
+String inputText1 = "", inputText2 = "", clonedSSID = "";
+
+enum App {NEOFETCH, STOPWATCH, PORTAL, PACKET_ANALYZER, WIFI_SCANNER, CLONER, BREAKOUT} currentApp = NEOFETCH;
+bool wifiScanInProgress = false;
+int numNetworks = 0, closestRSSI = -100;
+String wifiSSIDs[10], closestSSID = "";
+int wifiRSSIs[10];
+
+int packetCount = 0, currentChannel = 1, pps = 0;
+int graphData[GRAPH_WIDTH];
+int graphIndex = 0;
+unsigned long lastPpsUpdateTime = 0;
+unsigned long lastWiFiScanUpdateTime = 0; // Time tracking for Wi-Fi scanner
+String packetType = "";
+int packetRSSI = 0;
+
+// Breakout game variables
+int paddleX = SCREEN_WIDTH / 2 - 10;
+int paddleY = SCREEN_HEIGHT - 10;
+int ballX = SCREEN_WIDTH / 2;
+int ballY = SCREEN_HEIGHT / 2;
+int ballDirX = 1;
+int ballDirY = 1;
+int lives = 3;
+bool breakoutGameActive = false;
+bool bricks[5][10]; // 5 rows, 10 columns of bricks
+int brickWidth = 12;
+int brickHeight = 4;
+
+void bootAnimation() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Booting...");
+
+  // Draw a progress bar
+  for (int i = 0; i <= 100; i += 10) {
+    display.fillRect(0, 20, (i * SCREEN_WIDTH) / 100, 10, SSD1306_WHITE);
+    display.display();
+    delay(150);
+  }
+
+  display.clearDisplay();
+  display.display();
+}
+
+// Function to animate app switching at the top of the screen
+void animateAppSwitch() {
+  display.clearDisplay();
+  for (int16_t i = 0; i <= SCREEN_WIDTH; i += 8) { // Increase step size
+    display.drawLine(0, 0, i, 0, SSD1306_WHITE);
+    display.display();
+    delay(1); // Reduce delay
+  }
+}
+
+void handleRoot() {
+  String html = "<html><body><h1>ESP32 Portal</h1>"
+                "<form action='/submit' method='POST'>"
+                "<input type='text' name='inputText1' placeholder='Text Box 1'><br>"
+                "<input type='text' name='inputText2' placeholder='Text Box 2'><br>"
+                "<input type='submit' value='Submit'>"
+                "</form>"
+                "<p>Current cloned SSID: " + clonedSSID + "</p>"
+                "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSavedInfo() {
+  String html = "<html><body><h1>Saved Information</h1>"
+                "<p>Text 1: " + inputText1 + "</p>"
+                "<p>Text 2: " + inputText2 + "</p>"
+                "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleFormSubmit() {
+  if (server.hasArg("inputText1") && server.hasArg("inputText2")) {
+    inputText1 = server.arg("inputText1");
+    inputText2 = server.arg("inputText2");
+    Serial.printf("Received text 1: %s\n", inputText1.c_str());
+    Serial.printf("Received text 2: %s\n", inputText2.c_str());
+
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.println("Portal");
+    display.drawLine(0, 16, SCREEN_WIDTH, 16, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.printf("Text 1: %s\nText 2: %s\n", inputText1.c_str(), inputText2.c_str());
+
+    // Display connected devices MAC addresses only
+    display.setCursor(0, 40);
+    wifi_sta_list_t stationList;
+    esp_wifi_ap_get_sta_list(&stationList);
+    if (stationList.num == 0) {
+      display.setCursor(0, 50);
+      display.println("No devices connected");
+    } else {
+      for (int i = 0; i < stationList.num && i < 2; ++i) { // Display top 2 devices for space
+        wifi_sta_info_t station = stationList.sta[i];
+        char macStr[18];
+        snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", MAC2STR(station.mac));
+        display.setCursor(0, 50 + (i * 10));
+        display.println(macStr);
+      }
+    }
+    display.display();
+
+    server.send(200, "text/html", "<h1>Text and devices info submitted</h1>");
+  } else {
+    server.send(200, "text/html", "<h1>No text received</h1>");
+  }
+}
+
+void cloneWiFi() {
+  int n = WiFi.scanNetworks();
+  int bestRSSI = -100;
+  String bestSSID = "";
+
+  for (int i = 0; i < n; ++i) {
+    if (WiFi.RSSI(i) > bestRSSI) {
+      bestRSSI = WiFi.RSSI(i);
+      bestSSID = WiFi.SSID(i);
+    }
+  }
+  if (bestSSID != "") {
+    clonedSSID = bestSSID;
+    WiFi.softAP(clonedSSID.c_str());
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.println("Cloner");
+    display.drawLine(0, 16, SCREEN_WIDTH, 16, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.printf("Cloning Wi-Fi...\n%s\n", clonedSSID.c_str());
+    display.display();
+  } else {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.println("Cloner");
+    display.drawLine(0, 16, SCREEN_WIDTH, 16, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.println("No Wi-Fi networks found");
+    display.display();
+  }
+}
+
+void displayStopwatch() {
+  unsigned long elapsed = millis() - stopwatchStart;
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.println("Stopwatch");
+  display.drawLine(0, 16, SCREEN_WIDTH, 16, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.printf("Time: %um %us\n", (elapsed / (1000 * 60)) % 60, (elapsed / 1000) % 60);
+  display.display();
+}
+
+void displayNeofetch() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Neofetch");
+  display.drawLine(0, 16, SCREEN_WIDTH, 16, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.println("ESP32 OS");
+  display.setCursor(0, 30);
+  display.println("Kernel: 5.4.72");
+  display.setCursor(0, 40);
+  display.printf("Uptime: %um\nCPU: 240MHz\nHeap: %u\n", millis() / 1000 / 60, ESP.getFreeHeap());
+  display.display();
+}
+
+void displayWiFiScanner() {
+  display.clearDisplay();
+  display.setTextSize(1);
+
+  // Draw the RSSI graph at the top
+  drawWiFiGraph();
+
+  if (numNetworks == 0) {
+    display.setCursor(0, GRAPH_HEIGHT + 2);
+    display.println("No networks found");
+  } else {
+    for (int i = 0; i < numNetworks && i < 8; ++i) {
+      display.setCursor(0, GRAPH_HEIGHT + 2 + i * 8);
+      display.printf("%s (%d) %s", wifiSSIDs[i].c_str(), wifiRSSIs[i], isNetworkSecure(WiFi.encryptionType(i)) ? "O" : "X");
+    }
+  }
+
+  display.display();
+}
+
+bool isNetworkSecure(int encryptionType) {
+  switch (encryptionType) {
+    case WIFI_AUTH_OPEN: return false;
+    case WIFI_AUTH_WEP: return false;
+    case WIFI_AUTH_WPA_PSK: return true;
+    case WIFI_AUTH_WPA2_PSK: return true;
+    case WIFI_AUTH_WPA_WPA2_PSK: return true;
+    case WIFI_AUTH_WPA2_ENTERPRISE: return true;
+    case WIFI_AUTH_WPA3_PSK: return true;
+    case WIFI_AUTH_WPA2_WPA3_PSK: return true;
+    default: return false;
+  }
+}
+
+void startWiFiScanner() {
+  if (!wifiScanInProgress) {
+    wifiScanInProgress = true;
+    WiFi.scanNetworks(true); // Start an async scan
+  }
+}
+
+void updateWiFiScanner() {
+  if (wifiScanInProgress) {
+    int n = WiFi.scanComplete();
+    if (n >= 0) {
+      numNetworks = n;
+      closestRSSI = -100;
+      for (int i = 0; i < numNetworks && i < 10; ++i) {
+        wifiSSIDs[i] = WiFi.SSID(i);
+        wifiRSSIs[i] = WiFi.RSSI(i);
+        if (WiFi.RSSI(i) > closestRSSI) {
+          closestRSSI = WiFi.RSSI(i);
+          closestSSID = WiFi.SSID(i);
+        }
+      }
+      WiFi.scanDelete(); // Clear the scan results
+      wifiScanInProgress = false;
+
+      // Update the graph with the closest RSSI value
+      graphData[graphIndex] = map(closestRSSI, -100, 0, 0, GRAPH_HEIGHT - 1);
+      graphIndex = (graphIndex + 1) % GRAPH_WIDTH;
+    } else if (n == WIFI_SCAN_FAILED) {
+      WiFi.scanNetworks(true); // Retry the scan if it failed
+    }
+  }
+}
+
+void switchMode() {
+  animateAppSwitch();
+  currentApp = static_cast<App>((currentApp + 1) % 7); // Updated for new app
+  switch (currentApp) {
+    case NEOFETCH:
+      displayNeofetch();
+      break;
+    case STOPWATCH:
+      displayStopwatch();
+      break;
+    case PORTAL:
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setCursor(0, 0);
+      display.println("Portal");
+      display.drawLine(0, 16, SCREEN_WIDTH, 16, SSD1306_WHITE);
+      display.display();
+      break;
+    case PACKET_ANALYZER:
+      displayPacketMonitor();
+      break;
+    case WIFI_SCANNER:
+      startWiFiScanner();
+      displayWiFiScanner();
+      break;
+    case CLONER:
+      cloneWiFi();
+      break;
+    case BREAKOUT:
+      breakoutGameActive = true;
+      break;
+  }
+}
+
+void displayPacketMonitor() {
+  display.clearDisplay();
+  display.setTextSize(1);
+
+  // Draw the packet count graph at the top
+  drawWiFiGraph();
+
+  display.setCursor(0, GRAPH_HEIGHT + 2);
+  display.printf("Stats Display:");
+  display.setCursor(0, GRAPH_HEIGHT + 12);
+  display.printf("RSSI: %d", packetRSSI);
+  display.setCursor(0, GRAPH_HEIGHT + 22);
+  display.printf("Type: %s", packetType.c_str());
+  display.setCursor(0, GRAPH_HEIGHT + 32);
+  display.printf("Channel: %d", currentChannel);
+  display.setCursor(0, GRAPH_HEIGHT + 42);
+  display.printf("Packets/s: %d", pps);
+
+  display.display();
+}
+
+void updatePacketMonitor() {
+  // Change channel every second
+  if (millis() - lastPpsUpdateTime > 1000) {
+    currentChannel = (currentChannel % 13) + 1; // Cycle through channels 1 to 13
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+
+    // Calculate packets per second (PPS)
+    unsigned long currentTime = millis();
+    pps = packetCount / ((currentTime - lastPpsUpdateTime) / 1000.0);
+    lastPpsUpdateTime = currentTime;
+
+    // Reset packet count
+    packetCount = 0;
+  }
+
+  // Update the graph with the PPS value
+  graphData[graphIndex] = map(pps, 0, 100, 0, GRAPH_HEIGHT - 1);
+  graphIndex = (graphIndex + 1) % GRAPH_WIDTH;
+}
+
+void packetSniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
+  wifi_promiscuous_pkt_t *packet = (wifi_promiscuous_pkt_t *)buf;
+
+  // Increment packet count
+  packetCount++;
+
+  // Decode packet
+  decodePacket(packet);
+}
+
+void decodePacket(const wifi_promiscuous_pkt_t *packet) {
+  packetRSSI = packet->rx_ctrl.rssi;
+
+  switch (packet->payload[0]) {
+    case 0x08:
+      packetType = "Data";
+      break;
+    case 0x40:
+      packetType = "Probe Request";
+      break;
+    case 0x50:
+      packetType = "Probe Response";
+      break;
+    case 0x80:
+      packetType = "Beacon";
+      break;
+    case 0xA0:
+      packetType = "Disassociation";
+      break;
+    case 0xC0:
+      packetType = "Deauthentication";
+      break;
+    default:
+      packetType = "Unknown";
+      break;
+  }
+}
+
+void drawWiFiGraph() {
+  int graphY = 0; // Position the graph at the top
+  display.drawRect(0, graphY, GRAPH_WIDTH, GRAPH_HEIGHT, SSD1306_WHITE);
+  for (int i = 0; i < GRAPH_WIDTH; i++) {
+    int x = (graphIndex + i) % GRAPH_WIDTH;
+    int y = graphData[x];
+    display.drawPixel(i, graphY + (GRAPH_HEIGHT - 1 - y), SSD1306_WHITE);
+  }
+}
+
+void initBricks() {
+  for (int row = 0; row < 5; row++) {
+    for (int col = 0; col < 10; col++) {
+      bricks[row][col] = true;
+    }
+  }
+}
+void drawBricks() {
+  for (int row = 0; row < 5; row++) {
+    for (int col = 0; col < 10; col++) {
+      if (bricks[row][col]) {
+        display.fillRect(col * brickWidth, row * brickHeight, brickWidth - 1, brickHeight - 1, SSD1306_WHITE);
+      }
+    }
+  }
+}
+
+void resetBallAndPaddle() {
+  ballX = SCREEN_WIDTH / 2;
+  ballY = SCREEN_HEIGHT / 2;
+  ballDirX = 1;
+  ballDirY = 1;
+  paddleX = SCREEN_WIDTH / 2 - 10;
+}
+
+void playBreakout() {
+  initBricks();
+  lives = 3;
+  breakoutGameActive = true;
+
+  while (breakoutGameActive) {
+    // Move paddle
+    if (digitalRead(buttonPin) == LOW) {
+      paddleX += 5;
+      if (paddleX > SCREEN_WIDTH - 20) paddleX = SCREEN_WIDTH - 20;
+    } else {
+      paddleX -= 5;
+      if (paddleX < 0) paddleX = 0;
+    }
+
+    // Move ball
+    ballX += ballDirX;
+    ballY += ballDirY;
+
+    // Ball collision with walls
+    if (ballX <= 0 || ballX >= SCREEN_WIDTH - 2) ballDirX = -ballDirX;
+    if (ballY <= 0) ballDirY = -ballDirY;
+    if (ballY >= SCREEN_HEIGHT - 2) {
+      lives--;
+      if (lives == 0) {
+        breakoutGameActive = false; // Game over
+      } else {
+        resetBallAndPaddle(); // Reset ball and paddle for next try
+      }
+    }
+
+    // Ball collision with paddle
+    if (ballY >= paddleY - 2 && ballX >= paddleX && ballX <= paddleX + 20) {
+      ballDirY = -ballDirY;
+    }
+
+    // Ball collision with bricks
+    bool allBricksBroken = true;
+    for (int row = 0; row < 5; row++) {
+      for (int col = 0; col < 10; col++) {
+        if (bricks[row][col]) {
+          allBricksBroken = false;
+          int brickX = col * brickWidth;
+          int brickY = row * brickHeight;
+          if (ballX >= brickX && ballX <= brickX + brickWidth && ballY >= brickY && ballY <= brickY + brickHeight) {
+            ballDirY = -ballDirY;
+            bricks[row][col] = false;
+          }
+        }
+      }
+    }
+
+    // Check if all bricks are broken
+    if (allBricksBroken) {
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setCursor(0, SCREEN_HEIGHT / 2 - 10);
+      display.println("You Win!");
+      display.display();
+      delay(1000); // Show win message for 1 second
+
+      // Restart game after winning
+      lives = 3;
+      resetBallAndPaddle();
+      initBricks();
+    }
+
+    // Clear display
+    display.clearDisplay();
+
+    // Draw paddle
+    display.fillRect(paddleX, paddleY, 20, 2, SSD1306_WHITE);
+
+    // Draw ball
+    display.fillRect(ballX, ballY, 2, 2, SSD1306_WHITE);
+
+    // Draw bricks
+    drawBricks();
+
+    // Display everything
+    display.display();
+
+    // Delay for game speed
+    delay(10);
+  }
+
+  // Game over message
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, SCREEN_HEIGHT / 2 - 10);
+  display.println("Game Over");
+  display.display();
+  delay(1000); // Show game over message for 1 second
+
+  // Restart game after game over
+  lives = 3;
+  resetBallAndPaddle();
+  initBricks();
+  breakoutGameActive = true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(buttonPin, INPUT_PULLUP);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+
+  // Ensure the display is properly initialized and cleared
+  display.clearDisplay();
+  display.display();
+
+  // Initialize text settings
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+
+  // Display Neofetch on startup
+  displayNeofetch();
+
+  WiFi.softAP(ssid, password);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+
+  dnsServer.start(53, "*", apIP);
+  server.on("/", handleRoot);
+  server.on("/submit", HTTP_POST, handleFormSubmit);
+  server.on("/saved", handleSavedInfo); // New endpoint for saved information
+  server.onNotFound([]() {
+    server.sendHeader("Location", "/", true);
+    server.send(302, "text/plain", "");
+  });
+
+  server.begin();
+
+  stopwatchStart = millis(); // Start the stopwatch
+
+  // Setup Wi-Fi promiscuous mode for packet monitoring
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  esp_wifi_init(&cfg);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(packetSniffer);
+
+  // Start Wi-Fi scanner
+  startWiFiScanner();
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  if (digitalRead(buttonPin) == LOW) {
+    delay(100); // Debounce delay
+    if (digitalRead(buttonPin) == LOW) {
+      if (currentApp != BREAKOUT) { // Avoid switching apps if in breakout game
+        switchMode();
+        delay(500); // Avoid multiple toggles
+      }
+    }
+  }
+
+  // Continuously update the stopwatch display
+  if (currentApp == STOPWATCH) {
+    displayStopwatch();
+  }
+
+  // Update packet monitor display if it's the current app
+  if (currentApp == PACKET_ANALYZER) {
+    updatePacketMonitor();
+    displayPacketMonitor();
+  }
+
+  // Update Wi-Fi scanner display if it's the current app
+  if (currentApp == WIFI_SCANNER) {
+    updateWiFiScanner();
+    displayWiFiScanner();
+  }
+
+  // Play breakout game if it's the current app
+  if (currentApp == BREAKOUT) {
+    playBreakout();
+  }
+}
